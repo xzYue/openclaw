@@ -39,18 +39,20 @@ RUN mkdir -p /out && \
 # ── Stage 2: Build ──────────────────────────────────────────────
 FROM ${OPENCLAW_NODE_BOOKWORM_IMAGE} AS build
 
-# Install Bun (required for build scripts). Retry the whole bootstrap flow to
-# tolerate transient 5xx failures from bun.sh/GitHub during CI image builds.
+# Install Bun when available. Docker runtime builds use pnpm/node scripts,
+# so keep Bun bootstrap best-effort for networks where github.com is blocked.
 RUN set -eux; \
+    bun_ok=""; \
     for attempt in 1 2 3 4 5; do \
       if curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL https://bun.sh/install | bash; then \
+        bun_ok=1; \
         break; \
       fi; \
-      if [ "$attempt" -eq 5 ]; then \
-        exit 1; \
-      fi; \
       sleep $((attempt * 2)); \
-    done
+    done; \
+    if [ -z "$bun_ok" ]; then \
+      echo "WARN: Bun bootstrap skipped (network-restricted); continuing with pnpm/node build"; \
+    fi
 ENV PATH="/root/.bun/bin:${PATH}"
 
 RUN corepack enable
@@ -134,7 +136,21 @@ RUN --mount=type=cache,id=openclaw-bookworm-apt-cache,target=/var/cache/apt,shar
     apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get upgrade -y --no-install-recommends && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      procps hostname curl git lsof openssl
+      build-essential \
+      cargo \
+      curl \
+      file \
+      git \
+      hostname \
+      iputils-ping \
+      lsof \
+      openssl \
+      procps \
+      python3 \
+      python3-pip \
+      python3-venv \
+      ruby-full \
+      rustc
 
 RUN chown node:node /app
 
@@ -166,6 +182,31 @@ RUN install -d -m 0755 "$COREPACK_HOME" && \
       sleep $((attempt * 2)); \
     done && \
     chmod -R a+rX "$COREPACK_HOME"
+
+  # Install uv from PyPI and bootstrap Linuxbrew from domestic mirrors so the
+  # runtime container ships with common CLI tooling even on GitHub-restricted
+  # networks.
+  ENV HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew
+  ENV HOMEBREW_REPOSITORY=/home/linuxbrew/.linuxbrew/Homebrew
+  ENV HOMEBREW_BREW_GIT_REMOTE=https://mirrors.ustc.edu.cn/brew.git
+  ENV HOMEBREW_CORE_GIT_REMOTE=https://mirrors.ustc.edu.cn/homebrew-core.git
+  ENV HOMEBREW_NO_AUTO_UPDATE=1
+  ENV HOMEBREW_NO_ENV_HINTS=1
+  ENV HOMEBREW_NO_ANALYTICS=1
+  ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/home/node/.cargo/bin:${PATH}"
+  RUN python3 -m pip install --no-cache-dir --break-system-packages -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        uv ipython requests httpx rich pydantic pytest && \
+    mkdir -p /home/linuxbrew/.linuxbrew && \
+    git clone --depth=1 "$HOMEBREW_BREW_GIT_REMOTE" "$HOMEBREW_REPOSITORY" && \
+    mkdir -p "$HOMEBREW_PREFIX/bin" "$HOMEBREW_PREFIX/etc" "$HOMEBREW_PREFIX/include" "$HOMEBREW_PREFIX/lib" "$HOMEBREW_PREFIX/sbin" "$HOMEBREW_PREFIX/share" "$HOMEBREW_PREFIX/var" "$HOMEBREW_PREFIX/Homebrew" && \
+    ln -sf "$HOMEBREW_REPOSITORY/bin/brew" "$HOMEBREW_PREFIX/bin/brew" && \
+    ln -sf "$HOMEBREW_REPOSITORY/Library" "$HOMEBREW_PREFIX/Library" && \
+    ln -sf "$HOMEBREW_PREFIX/bin/brew" /usr/local/bin/brew && \
+      mkdir -p "$HOMEBREW_REPOSITORY/Library/Taps/homebrew" "$HOMEBREW_PREFIX/var/homebrew/locks" /usr/local/var/homebrew/locks && \
+      if [ ! -d "$HOMEBREW_REPOSITORY/Library/Taps/homebrew/homebrew-core/.git" ]; then git clone --depth=1 "$HOMEBREW_CORE_GIT_REMOTE" "$HOMEBREW_REPOSITORY/Library/Taps/homebrew/homebrew-core"; else git -C "$HOMEBREW_REPOSITORY/Library/Taps/homebrew/homebrew-core" remote set-url origin "$HOMEBREW_CORE_GIT_REMOTE"; fi && \
+    chown -R node:node /home/linuxbrew /usr/local/var/homebrew && \
+    su -s /bin/bash node -c 'HOMEBREW_PREFIX="$HOMEBREW_PREFIX" HOMEBREW_REPOSITORY="$HOMEBREW_REPOSITORY" brew --version' && \
+    su -s /bin/bash node -c 'HOMEBREW_PREFIX="$HOMEBREW_PREFIX" HOMEBREW_REPOSITORY="$HOMEBREW_REPOSITORY" brew install jq yq ripgrep fd tree'
 
 # Install additional system packages needed by your skills or extensions.
 # Example: docker build --build-arg OPENCLAW_DOCKER_APT_PACKAGES="python3 wget" .
